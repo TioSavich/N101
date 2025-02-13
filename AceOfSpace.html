@@ -1,0 +1,473 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Number Line (Auto-Scale, Multiple Bases)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    body {
+      display: flex; 
+      flex-direction: column; 
+      align-items: center; 
+      margin: 0; 
+      background: #eee;
+      font-family: sans-serif;
+      height: 100vh;
+      justify-content: center;
+    }
+    h1 {
+      margin: 0.5em;
+    }
+    .controls {
+      margin: 0.5em;
+      text-align: center;
+    }
+    .controls label {
+      margin: 0 5px;
+    }
+    .controls input, .controls select {
+      width: 60px; 
+      padding: 5px;
+      margin-right: 10px;
+      text-transform: uppercase;
+    }
+    .controls button {
+      padding: 5px 10px;
+      margin: 2px;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    #digit-display {
+      margin-top: 5px;
+      font-weight: bold;
+      font-size: 14px;
+    }
+    #number-line {
+      border: 1px solid #ccc;
+      background: #fff;
+      width: 100%;
+      max-width: 1000px;
+      height: 300px; 
+    }
+    .text-label {
+      font-size: 14px;
+      fill: #231f20;
+    }
+    .bold-label {
+      font-size: 14px;
+      font-weight: bold;
+      fill: #231f20;
+    }
+    .jump-label {
+      font-size: 14px;
+      font-weight: bold;
+      fill: blue;
+    }
+    .current-marker {
+      fill: orange;
+      stroke: black;
+      stroke-width: 1px;
+    }
+  </style>
+</head>
+<body>
+  <h1 id="title">Number Line (Base 10)</h1>
+  
+  <div class="controls">
+    <label for="base-select">Base:</label>
+    <select id="base-select">
+      <option value="4">4</option>
+      <option value="5">5</option>
+      <option value="6">6</option>
+      <option value="7">7</option>
+      <option value="8">8</option>
+      <option value="9">9</option>
+      <option value="10" selected>10</option>
+      <option value="11">11</option>
+      <option value="12">12</option>
+      <option value="13">13</option>
+      <option value="14">14</option>
+    </select>
+    
+    <label for="start-point">Start:</label>
+    <input type="text" id="start-point" value="0" />
+    
+    <label for="jump-size">Jump:</label>
+    <input type="text" id="jump-size" value="10" />
+    
+    <button id="jump-button">Jump</button>
+    <button id="reset-button">Reset</button>
+    <br/>
+    <button id="pan-left">Pan Left</button>
+    <button id="pan-right">Pan Right</button>
+    <button id="zoom-in">Zoom In</button>
+    <button id="zoom-out">Zoom Out</button>
+    <div id="digit-display"></div>
+  </div>
+  
+  <svg id="number-line" viewBox="0 0 1000 300"></svg>
+
+<script>
+// ---------------------------------------------------------------------
+// 1) Digit mapping and conversion for an arbitrary base
+// ---------------------------------------------------------------------
+let currentBase = 10; // default is base 10
+
+function getDigitMapping(base) {
+  if (base <= 10) {
+    return "0123456789".slice(0, base).split("");
+  }
+  const digits = "0123456789".split("");
+  const extrasMapping = { 10: "T", 11: "E", 12: "W", 13: "H" };
+  for (let d = 10; d < base; d++) {
+    digits.push(extrasMapping[d]);
+  }
+  return digits;
+}
+
+function parseNumber(str, base) {
+  let mapping = getDigitMapping(base);
+  let s = str.trim().toUpperCase();
+  if (!s) throw new Error("Empty input");
+  let negative = false;
+  if (s[0] === "-") {
+    negative = true;
+    s = s.substring(1);
+  }
+  if (!s) throw new Error("No digits after '-'");
+  let value = 0;
+  for (const ch of s) {
+    let digit = mapping.indexOf(ch);
+    if (digit === -1 || digit >= base) {
+      throw new Error(`Invalid digit '${ch}' for base ${base}`);
+    }
+    value = value * base + digit;
+  }
+  return negative ? -value : value;
+}
+
+function decimalToBase(n, base) {
+  let mapping = getDigitMapping(base);
+  if (n === 0) return "0";
+  let negative = n < 0;
+  if (negative) n = -n;
+  let result = "";
+  while (n > 0) {
+    let r = n % base;
+    result = mapping[r] + result;
+    n = Math.floor(n / base);
+  }
+  return negative ? "-" + result : result;
+}
+
+// ---------------------------------------------------------------------
+// 2) Global state variables
+// ---------------------------------------------------------------------
+let baseRangeMin = 0;  
+let baseRangeMax = 20; 
+let panOffset = 0;     
+let manualZoom = 1;    
+let currentPos = 0;    
+let jumps = [];
+let forcedLabels = new Set(); // forced tick values (in decimal)
+
+const svgWidth  = 1000;
+const svgHeight = 300;
+const padding   = 50;
+const centerY   = svgHeight / 2;
+
+// DOM elements
+const svg         = document.getElementById("number-line");
+const startInput  = document.getElementById("start-point");
+const jumpInput   = document.getElementById("jump-size");
+const jumpButton  = document.getElementById("jump-button");
+const resetButton = document.getElementById("reset-button");
+const panLeftBtn  = document.getElementById("pan-left");
+const panRightBtn = document.getElementById("pan-right");
+const zoomInBtn   = document.getElementById("zoom-in");
+const zoomOutBtn  = document.getElementById("zoom-out");
+const baseSelect  = document.getElementById("base-select");
+const titleH1     = document.getElementById("title");
+const digitDisplay = document.getElementById("digit-display");
+
+// ---------------------------------------------------------------------
+// 3) Update display of available digits
+// ---------------------------------------------------------------------
+function updateDigitDisplay() {
+  const mapping = getDigitMapping(currentBase);
+  digitDisplay.textContent = "Available digits: " + mapping.join(" ");
+}
+updateDigitDisplay();
+
+// ---------------------------------------------------------------------
+// 4) Auto-fit: recompute the “base range” from the forced labels.
+//     If all forced labels are positive, force the left boundary to 0.
+// ---------------------------------------------------------------------
+function recomputeRangeFromLabels() {
+  if (forcedLabels.size === 0) {
+    baseRangeMin = 0;
+    baseRangeMax = 20;
+    return;
+  }
+  let minVal = Infinity;
+  let maxVal = -Infinity;
+  forcedLabels.forEach(v => {
+    minVal = Math.min(minVal, v);
+    maxVal = Math.max(maxVal, v);
+  });
+  const margin = 5;
+  // If the smallest forced label is positive, start at 0.
+  baseRangeMin = (minVal > 0 ? 0 : minVal - margin);
+  baseRangeMax = maxVal + margin;
+  if (baseRangeMax < baseRangeMin + 10) {
+    baseRangeMax = baseRangeMin + 10;
+  }
+  panOffset = 0;
+  manualZoom = 1;
+}
+
+// ---------------------------------------------------------------------
+// 5) Draw the entire number line
+// ---------------------------------------------------------------------
+// Now, only multiples of the base will be drawn as the main tick marks.
+function drawNumberLine() {
+  const autoZoom = (svgWidth - 2 * padding) / (baseRangeMax - baseRangeMin);
+  const effectiveZoom = manualZoom * autoZoom;
+  
+  function valueToX(v) {
+    return padding + (v - baseRangeMin + panOffset) * effectiveZoom;
+  }
+  
+  defineArrowheads(effectiveZoom);
+  const savedDefs = svg.querySelector("defs");
+  svg.innerHTML = "";
+  if (savedDefs) svg.appendChild(savedDefs);
+  
+  // Draw the main axis.
+  const axisLine = document.createElementNS("http://www.w3.org/2000/svg", "line");
+  axisLine.setAttribute("x1", valueToX(baseRangeMin));
+  axisLine.setAttribute("y1", centerY);
+  axisLine.setAttribute("x2", valueToX(baseRangeMax));
+  axisLine.setAttribute("y2", centerY);
+  axisLine.setAttribute("stroke", "black");
+  axisLine.setAttribute("stroke-width", 2);
+  axisLine.setAttribute("marker-start", "url(#arrowhead)");
+  axisLine.setAttribute("marker-end", "url(#arrowhead)");
+  svg.appendChild(axisLine);
+  
+  // Determine visible range.
+  const leftVisible = (0 - padding) / effectiveZoom + baseRangeMin - panOffset;
+  const rightVisible = (svgWidth - padding) / effectiveZoom + baseRangeMin - panOffset;
+  
+  // Draw tick marks only at multiples of the base.
+  const step = currentBase;
+  const firstTick = Math.ceil(leftVisible / step) * step;
+  for (let v = firstTick; v <= rightVisible; v += step) {
+    drawTickAndLabel(v, false);
+  }
+  
+  // Draw forced labels that are NOT multiples (so they don't duplicate).
+  forcedLabels.forEach(v => {
+    if (v >= leftVisible && v <= rightVisible && v % currentBase !== 0) {
+      drawTickAndLabel(v, true);
+    }
+  });
+  
+  drawCurrentMarker();
+  jumps.forEach(j => drawJump(j));
+  
+  // --- Nested drawing helpers ---
+  function drawTickAndLabel(val, isForced) {
+    const x = valueToX(val);
+    const tick = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    tick.setAttribute("x1", x);
+    tick.setAttribute("y1", centerY - 5);
+    tick.setAttribute("x2", x);
+    tick.setAttribute("y2", centerY + 5);
+    tick.setAttribute("stroke", "#000");
+    tick.setAttribute("stroke-width", 2);
+    svg.appendChild(tick);
+    
+    const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    const labelText = decimalToBase(val, currentBase);
+    if (isForced) {
+      label.setAttribute("class", "bold-label");
+      label.setAttribute("x", x);
+      label.setAttribute("y", centerY + 25);
+      label.setAttribute("text-anchor", "middle");
+    } else {
+      label.setAttribute("class", "text-label");
+      label.setAttribute("x", x);
+      label.setAttribute("y", centerY - 10);
+      label.setAttribute("text-anchor", "middle");
+    }
+    label.textContent = labelText;
+    svg.appendChild(label);
+  }
+  
+  function drawCurrentMarker() {
+    const cx = valueToX(currentPos);
+    const marker = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+    marker.setAttribute("cx", cx);
+    marker.setAttribute("cy", centerY);
+    marker.setAttribute("r", 7);
+    marker.setAttribute("class", "current-marker");
+    svg.appendChild(marker);
+  }
+  
+  function drawJump(jump) {
+    const fromX = valueToX(jump.from);
+    const toX   = valueToX(jump.to);
+    const midX  = (fromX + toX) / 2;
+    const arcHgt = 40;
+    
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("d", `M ${fromX} ${centerY} Q ${midX} ${centerY - arcHgt} ${toX} ${centerY}`);
+    path.setAttribute("fill", "none");
+    path.setAttribute("stroke", "blue");
+    path.setAttribute("stroke-width", 2);
+    path.setAttribute("marker-end", "url(#arrowhead)");
+    svg.appendChild(path);
+    
+    const jumpSize = jump.to - jump.from;
+    const jumpStr  = decimalToBase(jumpSize, currentBase);
+    const lbl = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    lbl.setAttribute("class", "jump-label");
+    lbl.setAttribute("x", midX);
+    lbl.setAttribute("y", centerY - arcHgt - 5);
+    lbl.setAttribute("text-anchor", "middle");
+    lbl.textContent = (jumpSize >= 0 ? "+" : "") + jumpStr;
+    svg.appendChild(lbl);
+  }
+}
+
+// ---------------------------------------------------------------------
+// 6) Define arrowheads (scaled by effectiveZoom)
+// ---------------------------------------------------------------------
+function defineArrowheads(effectiveZoom) {
+  const oldDefs = svg.querySelector("defs");
+  if (oldDefs) oldDefs.remove();
+  const defs = document.createElementNS("http://www.w3.org/2000/svg", "defs");
+  const arrowScale = Math.min(2, effectiveZoom / 20);
+  const markerWidth  = 12 * arrowScale; 
+  const markerHeight = 10 * arrowScale; 
+  const refX         = 12 * arrowScale; 
+  const refY         = 5  * arrowScale;
+  
+  const marker = document.createElementNS("http://www.w3.org/2000/svg", "marker");
+  marker.setAttribute("id", "arrowhead");
+  marker.setAttribute("markerUnits", "userSpaceOnUse");
+  marker.setAttribute("orient", "auto-start-reverse");
+  marker.setAttribute("markerWidth",  markerWidth);
+  marker.setAttribute("markerHeight", markerHeight);
+  marker.setAttribute("refX", refX);
+  marker.setAttribute("refY", refY);
+  
+  const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  const scaledD = `
+    M 0,0
+    L ${10 * arrowScale}, ${5 * arrowScale}
+    L 0, ${10 * arrowScale}
+    Z
+  `;
+  path.setAttribute("d", scaledD.trim());
+  path.setAttribute("fill", "black");
+  
+  marker.appendChild(path);
+  defs.appendChild(marker);
+  svg.appendChild(defs);
+}
+
+// ---------------------------------------------------------------------
+// 7) Jump logic
+// ---------------------------------------------------------------------
+function handleJump() {
+  const jumpStr = jumpInput.value.trim().toUpperCase();
+  let sizeDecimal;
+  try {
+    sizeDecimal = parseNumber(jumpStr, currentBase);
+  } catch(e) {
+    alert("Invalid jump (base " + currentBase + "): " + e.message);
+    return;
+  }
+  if (sizeDecimal === 0) {
+    alert("Enter a nonzero jump size (base " + currentBase + ").");
+    return;
+  }
+  const newPos = currentPos + sizeDecimal;
+  jumps.push({ from: currentPos, to: newPos });
+  currentPos = newPos;
+  forcedLabels.add(newPos);
+  recomputeRangeFromLabels();
+  drawNumberLine();
+}
+
+// ---------------------------------------------------------------------
+// 8) Reset logic: When a new start value is entered, clear prior jumps.
+// ---------------------------------------------------------------------
+function handleReset() {
+  let newStartDec;
+  try {
+    newStartDec = parseNumber(startInput.value, currentBase);
+  } catch(e) {
+    alert("Invalid start (base " + currentBase + "): " + e.message);
+    return;
+  }
+  currentPos = newStartDec;
+  jumps = [];
+  forcedLabels.clear();
+  // Force only the new start value.
+  forcedLabels.add(currentPos);
+  recomputeRangeFromLabels();
+  drawNumberLine();
+}
+// Also, when the user changes the start input, reset automatically.
+startInput.addEventListener("change", handleReset);
+
+// ---------------------------------------------------------------------
+// 9) Pan & Zoom
+// ---------------------------------------------------------------------
+function panLeft() {
+  panOffset -= 5;
+  drawNumberLine();
+}
+function panRight() {
+  panOffset += 5;
+  drawNumberLine();
+}
+function zoomIn() {
+  manualZoom *= 1.25;
+  drawNumberLine();
+}
+function zoomOut() {
+  manualZoom *= 0.8;
+  drawNumberLine();
+}
+
+// ---------------------------------------------------------------------
+// 10) Base select: update currentBase, digit display, and reset.
+// ---------------------------------------------------------------------
+baseSelect.addEventListener("change", function() {
+  currentBase = Number(this.value);
+  titleH1.textContent = "Number Line (Base " + currentBase + ")";
+  updateDigitDisplay();
+  handleReset();
+});
+
+// ---------------------------------------------------------------------
+// 11) Event listeners
+// ---------------------------------------------------------------------
+jumpButton.addEventListener("click", handleJump);
+resetButton.addEventListener("click", handleReset);
+panLeftBtn.addEventListener("click", panLeft);
+panRightBtn.addEventListener("click", panRight);
+zoomInBtn.addEventListener("click", zoomIn);
+zoomOutBtn.addEventListener("click", zoomOut);
+
+// ---------------------------------------------------------------------
+// 12) Initialize with the starting value as the forced label
+// ---------------------------------------------------------------------
+handleReset();
+</script>
+</body>
+</html>
